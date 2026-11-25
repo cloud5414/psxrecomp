@@ -61,6 +61,10 @@ int cdrom_resident_feed_sector(uint32_t lba, const uint8_t* user_data);
 void cdrom_set_instant_rate(int per_frame);
 int  cdrom_get_instant_rate(void);
 
+/* Per-title compatibility quirk: when enabled, explicit SeekL/SeekP
+ * completion reports CDSTAT_READ. Disabled by default. */
+void cdrom_set_seek_complete_sets_read(int enabled);
+
 /* Strict, config-driven warm-load route accelerator. Up to 16 routes may be
  * registered after cdrom_init. A route arms only after arm_lba and activates
  * only if the following SetLoc values match lbas in order. Any mismatch

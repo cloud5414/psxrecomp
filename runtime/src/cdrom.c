@@ -435,6 +435,9 @@ uint32_t g_cd_overwrite_last_frame = 0;
  * effective ceiling is VBLANK_CYCLES_NTSC/CDROM_MIN_DELAY ≈ 1128/frame. */
 static int g_instant_max_per_frame = CDROM_INSTANT_MAX_PER_FRAME_DEFAULT;
 
+/* Per-title compatibility quirk. Off unless game.toml explicitly enables it. */
+static int g_seek_complete_sets_read = 0;
+
 /* Config-driven, game-specific warm-load routes. These deliberately change
  * only non-XA read cadence: the normal command, seek/motor timing, IRQ,
  * callback, DMA, and guest decompression paths remain authoritative. */
@@ -592,6 +595,10 @@ void cdrom_set_instant_rate(int per_frame) {
     g_instant_max_per_frame = per_frame;
 }
 int cdrom_get_instant_rate(void) { return g_instant_max_per_frame; }
+
+void cdrom_set_seek_complete_sets_read(int enabled) {
+    g_seek_complete_sets_read = enabled != 0;
+}
 
 static int instant_period(void) {
     int p = VBLANK_CYCLES_NTSC / g_instant_max_per_frame;
@@ -2738,7 +2745,8 @@ static void process_pending(uint32_t cycles) {
     case 0x15: /* SeekL complete */
     case 0x16: /* SeekP complete */
         stat_reg &= ~CDSTAT_SEEK;
-        stat_reg |= CDSTAT_READ;   /* PSX-CD-003: GT1 waits for READ after seek */
+        if (g_seek_complete_sets_read)
+            stat_reg |= CDSTAT_READ;   /* PSX-CD-003: GT1 waits for READ after seek */
         setloc_seek_far = 0;
         setloc_pending = 0;
         last_sector_have_raw = GETLOCL_NO_HEADER;

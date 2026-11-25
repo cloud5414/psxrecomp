@@ -19838,6 +19838,8 @@ int main(int argc, char** argv) {
             if (!game_discs.empty()) resolved_disc = game_discs.front();
             if (gc.runtime.has_memcard_dir)  memcard_dir   = gc.runtime.memcard_dir;
             g_fast_loading_optout = gc.runtime.fast_loading_optout;
+            cdrom_set_seek_complete_sets_read(
+                gc.runtime.cdrom_seek_complete_sets_read ? 1 : 0);
             /* settings.toml may name the cards of this install with one climb
              * ("../saves") when the exe folder is one level below this root:
              * the layout of a setup install. */

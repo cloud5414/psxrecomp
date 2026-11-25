@@ -599,6 +599,19 @@ controller    = "digital"       # "digital" or "dualshock"
 memcard_dir   = "."             # memcard files location, relative to project root
 ```
 
+### CD-ROM seek-completion compatibility
+
+`cdrom_seek_complete_sets_read` is a per-title compatibility quirk for games
+that wait for the CD-ROM `READ` status bit after an explicit `SeekL` or
+`SeekP` completes. It is disabled by default. When disabled, seek completion
+clears `SEEK` without forcing `READ`.
+
+```toml
+[runtime]
+cdrom_seek_complete_sets_read = true
+```
+Enable this only for titles that require the legacy PSX-CD-003 behavior.
+
 ### Opt-in warm CD routes
 
 Per-game read acceleration is disabled unless the game explicitly declares

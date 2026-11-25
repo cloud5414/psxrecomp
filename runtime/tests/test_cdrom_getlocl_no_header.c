@@ -86,8 +86,21 @@ int main(void) {
     /* Standby after SeekL: the seek completed, no data sector since [C6]. */
     setup(); target(1000); command(0x15); ack(); wait_complete(); ack();
     CHECK(!(stat_reg&CDSTAT_SEEK),"SeekL completed");
+    CHECK(!(stat_reg&CDSTAT_READ),
+          "SeekL completion does not force READ by default");
     CHECK(getlocl()==CDIRQ_ERROR && error80(),"standby after SeekL is INT5 80h");
     ack();
+
+    /* Legacy PSX-CD-003 compatibility: selected titles may require READ after
+     * explicit SeekL/SeekP completion. */
+    setup();
+    cdrom_set_seek_complete_sets_read(1);
+    target(1000); command(0x15); ack(); wait_complete(); ack();
+    CHECK(!(stat_reg&CDSTAT_SEEK),
+          "SeekL quirk completion clears SEEK");
+    CHECK((stat_reg&CDSTAT_READ),
+          "SeekL quirk completion sets READ");
+    cdrom_set_seek_complete_sets_read(0);
 
     /* ReadN issued, first data sector not yet delivered: seek phase. */
     setup(); target(200); command(6); ack();

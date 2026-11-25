@@ -381,6 +381,11 @@ struct RuntimeConfig {
     // disc reads still look like loads to the engage gate.
     bool                  fast_loading_optout = false;
 
+    // cdrom_seek_complete_sets_read: compatibility quirk for titles that wait
+    // for CDSTAT_READ after an explicit SeekL/SeekP completes. Off by default;
+    // normal seek completion clears CDSTAT_SEEK without forcing CDSTAT_READ.
+    bool                    cdrom_seek_complete_sets_read = false;
+
     // offer_turbo_loads: DEPRECATED AND IGNORED, now that the generic switch
     // it gated no longer exists. Defaults false and is never consulted; the
     // migrated titles that set it false stay correct, and the titles that

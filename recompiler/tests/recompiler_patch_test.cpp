@@ -131,6 +131,17 @@ note = "Test-only fixture"
           config.recompiler_patches[0].expected == 0x24020002u &&
           config.recompiler_patches[0].replacement == 0x24020001u,
           "parser preserves patch fields");
+    check(!config.runtime.cdrom_seek_complete_sets_read,
+          "CD-ROM seek-completion READ quirk defaults off");
+
+    const auto cdrom_seek_quirk = write_config(root, "cdrom-seek-quirk", R"toml(
+    [runtime]
+    cdrom_seek_complete_sets_read = true
+    )toml");
+    const auto cdrom_seek_quirk_config =
+        PSXRecompV4::load_game_config(cdrom_seek_quirk);
+    check(cdrom_seek_quirk_config.runtime.cdrom_seek_complete_sets_read,
+          "parser preserves CD-ROM seek-completion READ quirk");
 
     const auto audio_buffer = write_config(root, "audio-buffer", R"toml(
 [runtime]

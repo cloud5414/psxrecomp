@@ -711,6 +711,10 @@ static RuntimeConfig parse_runtime_block(const toml::value& cfg, const fs::path&
     }
     if (runtime.contains("fast_loading_optout"))
         rt.fast_loading_optout = toml::find<bool>(runtime, "fast_loading_optout");
+
+    if (runtime.contains("cdrom_seek_complete_sets_read"))
+        rt.cdrom_seek_complete_sets_read = toml::find<bool>(runtime, "cdrom_seek_complete_sets_read");
+
     if (runtime.contains("offer_turbo_loads")) {
         rt.offer_turbo_loads =
             toml::find<bool>(runtime, "offer_turbo_loads");
