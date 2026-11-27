@@ -51,6 +51,10 @@ bool mod_runtime_commit_netplay(const std::filesystem::path& disc_path = {},
 bool mod_runtime_netplay_settings_fingerprint(const PsxLobbyMatchCaps& caps,
                                                std::string& fingerprint,
                                                std::string* error = nullptr);
+bool mod_runtime_netplay_profile_content_fingerprint(const PsxLobbyMatchCaps& caps,
+                                                     const std::filesystem::path& disc_path,
+                                                     std::string& fingerprint,
+                                                     std::string* error = nullptr);
 /* [netplay] content_negotiation from game.toml. Off (default): clear package
  * simulation mods; an executable-owned profile takes precedence when present. */
 void mod_runtime_set_netplay_content_negotiation(bool enabled);
@@ -85,6 +89,9 @@ std::vector<std::string> mod_runtime_netplay_view_features(const ModResolution& 
  * publishes it and a host's plan never switches it. */
 bool mod_runtime_feature_host_only(const std::string& package_id,
                                    const std::string& feature_id);
+/* Persisted local choice, restricted to host-only features. */
+bool mod_runtime_local_feature_enabled(const std::string& package_id,
+                                       const std::string& feature_id);
 const std::string& mod_runtime_fingerprint();
 /* Empty scope preserves existing slots. Isolated packages require a committed,
  * verified content plan; resource preparation/preview alone establishes none. */

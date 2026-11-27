@@ -47,6 +47,8 @@ extern "C" const char* host_launch_timing_stage_name(uint32_t stage) {
 #endif
 
 #include <algorithm>
+#include <memory>
+#include <recomp_mod.h>
 #include <array>
 #include <cctype>
 #include <cstdlib>
@@ -567,27 +569,71 @@ void set_error(const std::string& error) {
     state().error = error;
 }
 
-void apply_main_write(const ModResolution::Write& write) {
-    if (write.fields.empty()) {
-        for (size_t i = 0; i < write.replacement.size(); ++i)
-            psx_host_write_byte((uint32_t)write.location + (uint32_t)i,
-                                write.replacement[i]);
-        dirty_ram_mark_executable_range(
-            (uint32_t)write.location & 0x1FFFFFFFu,
-            (uint32_t)write.replacement.size());
-        return;
+// The PSX resolver retains its manifest extensions and ordered field edits;
+// the shared transaction provider owns validation, mutation and restoration.
+bool apply_main_plan(RuntimeMods& s,bool restoring) {
+    struct Byte { uint8_t expected,replacement; };
+    std::map<uint32_t,Byte> bytes;
+    for(const auto& w:s.plan.writes) {
+        if(w.target!=ModPatchTarget::MainExe)continue;
+        for(size_t i=0;i<w.expected.size();++i) {
+            const uint32_t address=(uint32_t)w.location+(uint32_t)i;
+            const uint8_t expected=restoring?psx_read_byte(address):w.expected[i];
+            const auto inserted=bytes.emplace(address,Byte{expected,expected});
+            if(!inserted.second&&inserted.first->second.expected!=expected)return false;
+        }
     }
-    for (const ModResolution::Write::Field& field : write.fields) {
-        for (size_t i = 0; i < field.replacement.size(); ++i)
-            psx_host_write_byte(
-                (uint32_t)write.location +
-                    (uint32_t)field.offset + (uint32_t)i,
-                field.replacement[i]);
-        dirty_ram_mark_executable_range(
-            ((uint32_t)write.location +
-             (uint32_t)field.offset) & 0x1FFFFFFFu,
-            (uint32_t)field.replacement.size());
+    if(bytes.empty())return true;
+    for(const auto& w:s.plan.writes) {
+        if(w.target!=ModPatchTarget::MainExe)continue;
+        auto set=[&](size_t offset,const std::vector<uint8_t>& replacement) {
+            for(size_t i=0;i<replacement.size();++i) {
+                auto at=bytes.find((uint32_t)w.location+(uint32_t)offset+(uint32_t)i);
+                if(at==bytes.end())return false;
+                at->second.replacement=replacement[i];
+            }
+            return true;
+        };
+        if(w.fields.empty()) {if(!set(0,w.replacement))return false;}
+        else for(const auto& f:w.fields)if(!set(f.offset,f.replacement))return false;
     }
+    struct Extent {uint32_t address;std::vector<uint8_t> expected,replacement;};
+    std::vector<Extent> extents;
+    for(const auto& b:bytes) {
+        if(extents.empty()||(uint64_t)extents.back().address+extents.back().expected.size()!=b.first)
+            extents.push_back({b.first,{},{}});
+        extents.back().expected.push_back(b.second.expected);
+        extents.back().replacement.push_back(b.second.replacement);
+    }
+    std::vector<rmod_patch> patches;
+    for(const auto& x:extents)patches.push_back({"ram",x.address,x.expected.data(),x.replacement.data(),x.expected.size()});
+    std::unique_ptr<rmod_context,decltype(&rmod_destroy)> context(rmod_create(),rmod_destroy);
+    if(!context){s.error="Cannot allocate shared mod transaction";return false;}
+    // Packaged titles need not ship a loose PS-X EXE. The independently
+    // verified original disc remains the target identity in that case.
+    const std::string& original=s.exe_sha256.empty()?s.disc_sha256:s.exe_sha256;
+    if(!rmod_bind_plan(context.get(),s.game_id.c_str(),original.c_str(),s.plan.fingerprint.c_str())){
+        s.error=rmod_error(context.get());return false;
+    }
+    rmod_engine engine{};engine.game_id=s.game_id.c_str();engine.original_image_sha256=original.c_str();
+    // Called only at the owner-thread dispatch/restore safe point. No hooks or
+    // private state mutate within this byte transaction.
+    engine.begin=[](void*){return 1;};
+    engine.read=[](void*,const char* space,uint64_t a,uint8_t* out,size_t n){
+        if(std::strcmp(space,"ram")||a>UINT32_MAX||n>UINT32_MAX-a)return 0;
+        for(size_t i=0;i<n;++i)out[i]=psx_read_byte((uint32_t)(a+i));return 1;
+    };
+    engine.write=[](void*,const char* space,uint64_t a,const uint8_t* in,size_t n){
+        if(std::strcmp(space,"ram")||a>UINT32_MAX||n>UINT32_MAX-a)return 0;
+        for(size_t i=0;i<n;++i)psx_host_write_byte((uint32_t)(a+i),in[i]);
+        dirty_ram_mark_executable_range((uint32_t)a&0x1FFFFFFFu,(uint32_t)n);return 1;
+    };
+    engine.finish=[](void*,int){};
+    uint8_t identity[32];
+    const int result=rmod_apply(context.get(),patches.data(),patches.size(),nullptr,0,&engine,identity);
+    if(result<0){std::fputs("Shared mod transaction could not restore RAM\n",stderr);std::abort();}
+    if(!result)s.error=rmod_error(context.get());
+    return result==1;
 }
 
 bool restored_main_matches_plan(const RuntimeMods& s, uint32_t& failed_at) {
@@ -1665,7 +1711,7 @@ RecompLauncherCModProvider provider = {
     provider_feature_set_option,
     provider_diagnostic_count,
     provider_diagnostic_get,
-    nullptr, /* archive_extension â€” PSX defaults */
+    nullptr, /* archive_extension — PSX defaults */
     nullptr, /* archive_description */
     provider_commit_netplay,
     provider_feature_resource_count,
@@ -1996,7 +2042,11 @@ static bool prepare_profile_settings(const PSXModNetplayProfile* profile,
     return true;
 }
 
-/* Loader-only profiles use the existing lobby's one optional package offer.
+static bool prepare_resources(const std::filesystem::path& disc_path, std::string* error,
+                              bool require_disc_identity, ModPackageManager* selection);
+static bool netplay_resources_verified(const ModResolution& plan, std::string* error);
+
+/* Loading profiles use the existing lobby's one optional package offer.
  * Settings-only profiles below retain their established canonical codec. */
 static bool prepare_profile_loader(const PSXModNetplayProfile* profile,
                                     const PsxLobbyMatchCaps* caps,
@@ -2021,15 +2071,19 @@ static bool prepare_profile_loader(const PSXModNetplayProfile* profile,
     }
     loading = selected.feature_enabled(profile->loading_package_id, profile->loading_feature_id);
     if (!verify_title_loading_disc(s, disc_path, error)) return false;
+    if (!prepare_resources(disc_path, error, true, &selected)) return false;
     plan = selected.resolve(s.game_id, s.exe_sha256, s.disc_sha256);
-    if (!plan.ok || !plan.writes.empty() || !plan.overlays.empty() ||
-        !plan.derived_discs.empty() || !plan.resources.empty() ||
-        plan.plugins.size() != (loading ? 1u : 0u) ||
-        (loading && (plan.plugins[0].id != profile->loading_plugin_id ||
-                     !mod_plugin_registered(profile->loading_plugin_id)))) {
-        if (error) *error = "Title loading option must resolve to its native plugin";
+    if (!plan.ok) {
+        if (error) *error = plan.errors.empty() ? "Invalid title loading plan" : plan.errors.front();
         return false;
     }
+    if (plan.plugins.size() != (loading ? 1u : 0u) ||
+        (loading && (plan.plugins[0].id != profile->loading_plugin_id ||
+                     !mod_plugin_registered(profile->loading_plugin_id)))) {
+        if (error) *error = "Title loading provider is unavailable or differs from the profile";
+        return false;
+    }
+    if (!netplay_resources_verified(plan, error)) return false;
     if (caps && caps->valid && caps->mod_count == 1 && plan.fingerprint != caps->mod_plan_fp) {
         if (error) *error = "Title loading option differs from the host's verified plan";
         return false;
@@ -2051,6 +2105,18 @@ bool mod_runtime_netplay_settings_fingerprint(const PsxLobbyMatchCaps& caps,
     return prepare_profile_settings(profile, &caps, plan, fingerprint, error);
 }
 
+static bool prepare_profile_content(const PSXModNetplayProfile* profile,
+                                    const PsxLobbyMatchCaps* caps,
+                                    const std::filesystem::path& disc_path,
+                                    ModResolution& plan, std::string& options_identity,
+                                    std::string& offer_identity,
+                                    std::optional<ModPackageManager>& selection,
+                                    std::string* error);
+struct PreparedPlanInputs;
+static bool install_plan(RuntimeMods& s, ModResolution plan,
+                         bool save_selection, bool verify_netplay,
+                         std::string* error, const PreparedPlanInputs* inputs);
+
 bool mod_runtime_commit_netplay(const std::filesystem::path& disc_path,
                                 std::string* error) {
     if (!mod_runtime_clear_for_netplay(error)) return false;
@@ -2065,14 +2131,22 @@ bool mod_runtime_commit_netplay(const std::filesystem::path& disc_path,
     std::string options_identity;
     const PsxLobbyMatchCaps* caps = psx_lobby_match_caps();
     ModPackageManager loader_selection;
+    std::optional<ModPackageManager> content_selection;
+    std::string content_identity;
     bool loading = false;
     if (profile->loading_plugin_id) {
         if (!prepare_profile_loader(profile, caps, disc_path, plan, options_identity,
                                     loader_selection, loading, error)) return false;
+    } else if (profile->content_feature_count) {
+        if (!prepare_profile_content(profile, caps, disc_path, plan, options_identity,
+                                     content_identity, content_selection, error)) return false;
     } else if (!prepare_profile_settings(profile, caps, plan, options_identity, error)) return false;
+    const std::string& offer_identity = content_identity.empty() ? options_identity : content_identity;
     if (profile->settings_package_id && caps && caps->valid && caps->mod_count != 0 &&
-        options_identity != caps->mod_plan_fp) {
-        if (error) *error = "Title netplay settings fingerprint does not match the host offer";
+        offer_identity != caps->mod_plan_fp) {
+        if (error) *error = profile->content_feature_count
+            ? "Title netplay settings or verified content differs from the host offer"
+            : "Title netplay settings fingerprint does not match the host offer";
         return false;
     }
     const bool option_renderer = profile->renderer_option_id &&
@@ -2096,7 +2170,9 @@ bool mod_runtime_commit_netplay(const std::filesystem::path& disc_path,
     if (profile->loading_plugin_id) psx_mod_netplay_set_loading(loading);
     plan.ok = true;
     plan.fingerprint = profile->compatibility_id;
-    if (!options_identity.empty()) {
+    if (content_selection) {
+        plan.fingerprint = content_identity;
+    } else if (!options_identity.empty()) {
         char identity[65];
         if (!psx_mod_netplay_content_identity("", identity)) return false;
         plan.fingerprint = identity;
@@ -2106,15 +2182,30 @@ bool mod_runtime_commit_netplay(const std::filesystem::path& disc_path,
         profile->settings_feature_id ? profile->settings_feature_id : ""});
     if (renderer) plan.plugins.push_back({renderer, "", ""});
     s.disc_path = disc_path;
-    s.plan = std::move(plan);
-    s.plan_committed = true;
-    reset_live_option_overrides();  /* a new plan ends the last session's live values */
+    // Use the normal guarded installer for writes, overlays, imported media
+    // and derived discs; profile ownership does not change those capabilities.
+    if (!install_plan(s, std::move(plan), false, true, error, nullptr)) {
+        // The failed temporary selection owns plan.ordered. Keep the error,
+        // not pointers into that selection after it leaves this scope.
+        const std::string why = error ? *error : s.error;
+        s.validation = {};
+        if (!why.empty()) s.validation.errors.push_back(why);
+        psx_mod_netplay_set_options_identity("");
+        psx_mod_netplay_set_loading(0);
+        return false;
+    }
     if (profile->loading_plugin_id) {
         if (!offline_manager_before_netplay) offline_manager_before_netplay = s.manager;
         s.manager = std::move(loader_selection);
         mod_runtime_set_session_plan_fp(options_identity);
         std::fprintf(stdout, "psxrecomp: title netplay loading = %s\n",
                      loading ? "resident assets" : "original disc loader");
+    } else if (content_selection) {
+        if (!offline_manager_before_netplay) offline_manager_before_netplay = std::move(s.manager);
+        s.manager = std::move(*content_selection);
+        mod_runtime_set_session_plan_fp(content_identity);
+        std::fprintf(stdout, "psxrecomp: verified title netplay content %s\n",
+                     content_identity.c_str());
     } else mod_runtime_set_session_plan_fp({});
     psx_mod_netplay_set_active(1);
     std::fprintf(stdout, "psxrecomp: title netplay profile %s (%s)\n",
@@ -2217,14 +2308,13 @@ static bool feat_csv_all_known(const ModPackage& package, const char* csv,
     return true;
 }
 
-static bool apply_host_mod_plan(const PsxLobbyMatchCaps& caps, std::string* error) {
-    RuntimeMods& s = state();
-    if (!s.initialized) return true;
+static bool apply_host_mod_plan(ModPackageManager& manager, const PsxLobbyMatchCaps& caps,
+                                std::string* error) {
     for (int i = 0; i < caps.mod_count; ++i) {
         const PsxLobbyModPkg& pkg = caps.mods[i];
         if (!pkg.id[0]) continue;
         std::string err;
-        if (pkg.ver[0] && !s.manager.select_version(pkg.id, pkg.ver, &err)) {
+        if (pkg.ver[0] && !manager.select_version(pkg.id, pkg.ver, &err)) {
             if (error) *error = err.empty()
                 ? (std::string(pkg.id) + " " + pkg.ver + " is not installed")
                 : err;
@@ -2233,9 +2323,9 @@ static bool apply_host_mod_plan(const PsxLobbyMatchCaps& caps, std::string* erro
     }
     for (int pass = 0; pass < 8; ++pass) {
         bool changed = false;
-        for (const auto& item : s.manager.packages()) {
+        for (const auto& item : manager.packages()) {
             const std::string& package_id = item.first;
-            const ModPackage* package = s.manager.selected_package(package_id);
+            const ModPackage* package = manager.selected_package(package_id);
             if (!package) continue;
             int required = -1;
             for (int i = 0; i < caps.mod_count; ++i) {
@@ -2251,7 +2341,7 @@ static bool apply_host_mod_plan(const PsxLobbyMatchCaps& caps, std::string* erro
                 const bool have = package_has_enabled_feature(*package);
                 if (want == have) continue;
                 std::string err;
-                if (!s.manager.set_enabled(package_id, want, &err) && want) {
+                if (!manager.set_enabled(package_id, want, &err) && want) {
                     if (error) *error = err;
                     return false;
                 }
@@ -2264,10 +2354,10 @@ static bool apply_host_mod_plan(const PsxLobbyMatchCaps& caps, std::string* erro
                 if (feature.host_only) continue;
                 const bool want = required >= 0 &&
                     feat_csv_wants(caps.mods[required].feats, feature.id);
-                const bool have = s.manager.feature_enabled(package_id, feature.id);
+                const bool have = manager.feature_enabled(package_id, feature.id);
                 if (want == have) continue;
                 std::string err;
-                if (!s.manager.set_feature_enabled(package_id, feature.id, want, &err)) {
+                if (!manager.set_feature_enabled(package_id, feature.id, want, &err)) {
                     if (want) {
                         if (error) *error = err;
                         return false;
@@ -2282,7 +2372,7 @@ static bool apply_host_mod_plan(const PsxLobbyMatchCaps& caps, std::string* erro
     for (int i = 0; i < caps.mod_count; ++i) {
         const PsxLobbyModPkg& pkg = caps.mods[i];
         if (!pkg.id[0]) continue;
-        const ModPackage* package = s.manager.selected_package(pkg.id);
+        const ModPackage* package = manager.selected_package(pkg.id);
         if (!package) {
             if (error) *error = std::string(pkg.id) + " is not installed";
             return false;
@@ -2293,7 +2383,7 @@ static bool apply_host_mod_plan(const PsxLobbyMatchCaps& caps, std::string* erro
             return false;
         std::string err;
         if (legacy) {
-            if (!s.manager.set_enabled(pkg.id, true, &err)) {
+            if (!manager.set_enabled(pkg.id, true, &err)) {
                 if (error) *error = err;
                 return false;
             }
@@ -2302,11 +2392,11 @@ static bool apply_host_mod_plan(const PsxLobbyMatchCaps& caps, std::string* erro
         for (const ModFeature& feature : package->features) {
             if (feature.host_only) continue;
             const bool want = feat_csv_wants(pkg.feats, feature.id);
-            if (!s.manager.set_feature_enabled(pkg.id, feature.id, want, &err) && want) {
+            if (!manager.set_feature_enabled(pkg.id, feature.id, want, &err) && want) {
                 if (error) *error = err;
                 return false;
             }
-            if (want && !feat_csv_apply_options(s.manager, pkg.id, feature.id,
+            if (want && !feat_csv_apply_options(manager, pkg.id, feature.id,
                                                   pkg.feats, error))
                 return false;
         }
@@ -2334,7 +2424,7 @@ static bool netplay_resources_verified(const ModResolution& plan,
 }
 
 static bool prepare_resources(const std::filesystem::path& disc_path, std::string* error,
-                              bool require_disc_identity) {
+                              bool require_disc_identity, ModPackageManager* selection = nullptr) {
     HostLaunchTimingScope timing(HOST_LAUNCH_PREPARE_RESOURCES);
     RuntimeMods& s = state();
     if (!s.initialized) { timing.success(); return true; }
@@ -2351,7 +2441,8 @@ static bool prepare_resources(const std::filesystem::path& disc_path, std::strin
         s.disc_sha256 = std::move(digest);
     }
     const auto media_cache = media_cache_root();
-    if (!s.manager.prepare_resources(s.game_id, disc_path, media_cache, &s.error, s.cached_prepare,
+    auto& manager = selection ? *selection : s.manager;
+    if (!manager.prepare_resources(s.game_id, disc_path, media_cache, &s.error, s.cached_prepare,
             active_prepare_progress ? *active_prepare_progress : ModPrepareProgress{})) {
         if (error) *error = s.error;
         return false;
@@ -2362,6 +2453,125 @@ static bool prepare_resources(const std::filesystem::path& disc_path, std::strin
 
 bool mod_runtime_prepare_resources(const std::filesystem::path& disc_path, std::string* error) {
     return prepare_resources(disc_path, error, true);
+}
+
+/* The settings package keeps its existing codec. The remaining entries use
+ * the portable package plan, restricted to features named by the title. */
+static bool split_profile_offer(const PSXModNetplayProfile* profile, const PsxLobbyMatchCaps& caps,
+                                PsxLobbyMatchCaps& settings, PsxLobbyMatchCaps& content,
+                                std::string* error) {
+    if (caps.mod_count < 1 || caps.mod_count > PSX_LOBBY_MAX_MODS) {
+        if (error) *error = "Title netplay settings offer is missing or invalid";
+        return false;
+    }
+    settings.valid = content.valid = 1;
+    for (int i = 0; i < caps.mod_count; ++i) {
+        const auto& item = caps.mods[i];
+        if (!std::strcmp(item.id, profile->settings_package_id)) {
+            if (settings.mod_count) {
+                if (error) *error = "Title netplay offer repeats its settings package";
+                return false;
+            }
+            settings.mods[settings.mod_count++] = item;
+            continue;
+        }
+        if (std::any_of(content.mods, content.mods + content.mod_count,
+                [&](const PsxLobbyModPkg& existing) { return !std::strcmp(item.id, existing.id); })) {
+            if (error) *error = "Title netplay offer repeats content package " + std::string(item.id);
+            return false;
+        }
+        const std::string tokens = item.feats;
+        if (tokens.empty() || !item.ver[0]) {
+            if (error) *error = "Title netplay content requires a version and declared features";
+            return false;
+        }
+        std::istringstream features(tokens);
+        for (std::string token; std::getline(features, token, ',');) {
+            std::string feature, options;
+            feat_token_split(token, feature, options);
+            if (psx_mod_netplay_content_feature(item.id, feature.c_str())) continue;
+            if (error) *error = std::string(item.id) + "/" + feature +
+                ": feature is not declared for this title's netplay";
+            return false;
+        }
+        content.mods[content.mod_count++] = item;
+    }
+    if (settings.mod_count == 1) return true;
+    if (error) *error = "Title netplay settings offer is missing";
+    return false;
+}
+
+static bool prepare_profile_content(const PSXModNetplayProfile* profile,
+                                    const PsxLobbyMatchCaps* caps,
+                                    const std::filesystem::path& disc_path,
+                                    ModResolution& plan, std::string& options_identity,
+                                    std::string& offer_identity,
+                                    std::optional<ModPackageManager>& selection,
+                                    std::string* error) {
+    const bool published = caps && caps->valid;
+    PsxLobbyMatchCaps settings{}, content{};
+    if (published && !split_profile_offer(profile, *caps, settings, content, error)) return false;
+    if (!prepare_profile_settings(profile, published ? &settings : nullptr, plan,
+                                  options_identity, error)) return false;
+    offer_identity = options_identity;
+
+    RuntimeMods& s = state();
+    const ModPackageManager& offline = offline_manager_before_netplay
+        ? *offline_manager_before_netplay : s.manager;
+    if (published && !content.mod_count) return true;
+    if (!published && std::none_of(profile->content_features,
+            profile->content_features + profile->content_feature_count,
+            [&](const PSXModNetplayContentFeature& feature) {
+                return offline.feature_enabled(feature.package_id, feature.feature_id);
+            })) return true;
+
+    ModPackageManager selected = offline;
+    if (published && !apply_host_mod_plan(selected, content, error)) return false;
+    for (const auto& [id, versions] : selected.packages()) {
+        const auto* package = selected.selected_package(id);
+        if (!package) continue;
+        for (const auto& feature : package->features) {
+            if (!selected.feature_enabled(id, feature.id) ||
+                psx_mod_netplay_content_feature(id.c_str(), feature.id.c_str())) continue;
+            if (feature.legacy) {
+                if (!selected.set_enabled(id, false, error)) return false;
+            } else if (!selected.set_feature_enabled(id, feature.id, false, error)) return false;
+        }
+    }
+    for (const auto& feature : selected.implicit_features()) {
+        if (psx_mod_netplay_content_feature(feature.package_id.c_str(), feature.feature_id.c_str()))
+            continue;
+        if (error) *error = feature.package_id + "/" + feature.feature_id +
+            ": title netplay content depends on an undeclared feature";
+        return false;
+    }
+    if (!prepare_resources(disc_path, error, true, &selected)) return false;
+    ModResolution shared = selected.resolve(s.game_id, s.exe_sha256, s.disc_sha256);
+    if (!shared.ok) {
+        if (error) *error = shared.errors.empty() ? "Invalid title netplay content" : shared.errors.front();
+        return false;
+    }
+    if (!netplay_resources_verified(shared, error)) return false;
+    offer_identity = sha256_text("psx-trusted-profile-content-v1\n" + options_identity + "\n" +
+                                 shared.fingerprint);
+    shared.selections[profile->settings_package_id] =
+        std::move(plan.selections.at(profile->settings_package_id));
+    plan = std::move(shared);
+    selection.emplace(std::move(selected));
+    return true;
+}
+
+bool mod_runtime_netplay_profile_content_fingerprint(const PsxLobbyMatchCaps& caps,
+                                                     const std::filesystem::path& disc_path,
+                                                     std::string& fingerprint,
+                                                     std::string* error) {
+    const auto* profile = psx_mod_netplay_profile();
+    if (!profile || !profile->content_feature_count || !caps.valid) return false;
+    ModResolution plan;
+    std::string options_identity;
+    std::optional<ModPackageManager> selection;
+    return prepare_profile_content(profile, &caps, disc_path, plan, options_identity,
+                                   fingerprint, selection, error);
 }
 
 bool mod_runtime_verify_session_plan_fp(std::string* error);
@@ -2408,7 +2618,9 @@ static bool install_plan(RuntimeMods& s, ModResolution plan,
     }
     for(const auto& plugin:plan.plugins) {
         if(plugin.id!="psx.hd-textures")continue;
-        const auto* package=s.manager.selected_package(plugin.package_id);
+        const auto selected=std::find_if(plan.ordered.begin(),plan.ordered.end(),
+            [&](const ModPackage* package) { return package && package->id==plugin.package_id; });
+        const auto* package=selected==plan.ordered.end()?nullptr:*selected;
         if(package&&!texture_install_check(*package,plugin.feature_id,s.error,true)) {
             if(error)*error=s.error;return false;
         }
@@ -2651,6 +2863,7 @@ std::string mod_runtime_plan_fingerprint_portable(const std::filesystem::path& d
         s.disc_sha256 = std::move(digest);
     }
     auto manager = title_loading ? title_loading_selection(s.manager) : s.manager;
+    if (title_loading && !prepare_resources(disc_path, error, true, &manager)) return {};
     ModResolution plan = manager.resolve(s.game_id, s.exe_sha256,
                                          s.disc_sha256);
     if (!plan.ok || !netplay_resources_verified(plan)) return {};
@@ -2697,7 +2910,7 @@ bool mod_runtime_commit_for_netplay(const std::filesystem::path& disc_path,
     ModPackageManager prior_manager = s.manager;
     const std::string prior_fp = session_plan_fp();
     mod_runtime_set_session_plan_fp(caps->mod_plan_fp);
-    if (!apply_host_mod_plan(*caps, error) ||
+    if ((s.initialized && !apply_host_mod_plan(s.manager, *caps, error)) ||
         !mod_runtime_commit(disc_path, error, false)) {
         s.manager = std::move(prior_manager);
         mod_runtime_set_session_plan_fp(prior_fp);
@@ -2760,6 +2973,12 @@ bool mod_runtime_feature_host_only(const std::string& package_id,
     for (const ModFeature& feature : package->features)
         if (feature.id == feature_id) return feature.host_only;
     return false;
+}
+
+bool mod_runtime_local_feature_enabled(const std::string& package_id,
+                                       const std::string& feature_id) {
+    return mod_runtime_feature_host_only(package_id, feature_id) &&
+           state().manager.feature_enabled(package_id, feature_id);
 }
 
 std::vector<std::string> mod_runtime_netplay_view_features(const ModResolution& plan) {
@@ -2952,24 +3171,9 @@ extern "C" void mod_runtime_on_dispatch(uint32_t target) {
     if (!s.initialized || s.main_applied ||
         (target & 0x1FFFFFFFu) != s.entry_phys) return;
 
-    for (const ModResolution::Write& write : s.plan.writes) {
-        if (write.target != ModPatchTarget::MainExe) continue;
-        for (size_t i = 0; i < write.expected.size(); ++i) {
-            if (psx_read_byte((uint32_t)write.location + (uint32_t)i) !=
-                write.expected[i]) {
-                std::fprintf(stderr,
-                    "psxrecomp: mod plan %s rejected at 0x%08X "
-                    "(expected-byte guard failed; booting unmodified)\n",
-                    s.plan.fingerprint.c_str(),
-                    (unsigned)((uint32_t)write.location + (uint32_t)i));
-                s.main_applied = true;
-                return;
-            }
-        }
-    }
-    for (const ModResolution::Write& write : s.plan.writes) {
-        if (write.target != ModPatchTarget::MainExe) continue;
-        apply_main_write(write);
+    if(!apply_main_plan(s,false)) {
+        std::fprintf(stderr,"psxrecomp: guarded mod transaction rejected: %s\n",s.error.c_str());
+        s.main_applied=true;return;
     }
     s.main_applied = true;
     if (!s.plan.writes.empty())
@@ -3008,11 +3212,10 @@ extern "C" void mod_runtime_on_savestate_loaded(void) {
         }
     }
 
-    bool applied = false;
-    for (const ModResolution::Write& write : s.plan.writes) {
-        if (write.target != ModPatchTarget::MainExe) continue;
-        apply_main_write(write);
-        applied = true;
+    bool applied=false;
+    for(const auto& write:s.plan.writes)if(write.target==ModPatchTarget::MainExe)applied=true;
+    if(!apply_main_plan(s,true)) {
+        std::fprintf(stderr,"psxrecomp: restored mod transaction rejected: %s\n",s.error.c_str());return;
     }
     s.main_applied = true;
     for (const ModResolution::Plugin& plugin : s.plan.plugins) {

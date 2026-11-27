@@ -1,3 +1,4 @@
+#include <recomp_input.h>
 #include "audio_sync.h"
 #include "audio_catchup.h"
 /* main.cpp — Phase 3 runtime entry point.
@@ -34,9 +35,6 @@
 #include "boot_state.h"
 #include "source_stateio_identity.h"
 #include "bios_hle.h"
-#include "native_bios_boot.h"
-#include "native_bios_services.h"
-#include "psx_native_idle_wait.h"
 #include "bios_hle_plan.h"
 #include "psx_bios_known_images.h"
 #include "psx_bios_backend.h"
@@ -125,6 +123,7 @@ extern "C" uint32_t g_guest_last_store_addr, g_guest_last_store_val;
 #include "psx_selfcheck.h"
 #include "psx_lobby_client.h"
 #include "netplay_bios_settle.h"
+#include "netplay_lan_rtt.h"
 #include "netplay_exit_reason.h"
 #include "netplay_lan_version.h"
 #include "start_refusal.h"
@@ -227,6 +226,7 @@ extern "C" void psx_game_codegen_relaunch_or_exit(const char* disc_path);
 extern "C" void psx_game_codegen_forward_if_built(int argc, char** argv);
 #endif
 #include "psx_sdl.h"
+#include "controller_binding_snapshot.h"
 #include "window_fullscreen.h"
 #if defined(PSX_SDL3)
 /*
@@ -1767,6 +1767,10 @@ extern "C" int psx_mod_set_fixed_display_aspect(
     g_video_aspect_num = (int)numerator;
     g_video_aspect_den = (int)denominator;
     g_ws_adaptive_view = false;
+    // A title can select a fixed view after adaptive Fit has already updated
+    // the live drawable. Both renderers must finish using the new aspect.
+    gl_renderer_set_display_aspect(g_video_aspect_num, g_video_aspect_den);
+    vk_renderer_set_display_aspect(g_video_aspect_num, g_video_aspect_den);
     std::fprintf(stdout, "psxrecomp: mod selected fixed display aspect %u:%u\n",
                  (unsigned)numerator, (unsigned)denominator);
     return 1;
@@ -2324,8 +2328,6 @@ extern "C" int psx_ws_get_native_wide(void) { return g_ws_native_wide; }
 extern "C" int psx_debug_display_aspect(int num, int den, int adaptive) {
     if (adaptive) return psx_mod_set_adaptive_display_aspect(num, den);
     if (!psx_mod_set_fixed_display_aspect(num, den)) return 0;
-    gl_renderer_set_display_aspect(num, den);
-    vk_renderer_set_display_aspect(num, den);
     if (sdl_renderer) {
         g_logical_w = 480 * num * g_video_scale / den;
         SDL_RenderSetLogicalSize(sdl_renderer, g_logical_w, 480 * g_video_scale);
@@ -6343,21 +6345,15 @@ static bool controller_source_pressed_h(SDL_GameController* h, const ControllerS
     if (!h) return false;
     const int dz = deadzone_raw > 0 ? deadzone_raw : controller_deadzone;
 
-    switch (source.kind) {
-    case ControllerSource::Kind::Button:
-        return SDL_GameControllerGetButton(
-            h, (SDL_GameControllerButton)source.id) != 0;
-    case ControllerSource::Kind::AxisPositive:
-    case ControllerSource::Kind::AxisNegative: {
-        const int16_t v = SDL_GameControllerGetAxis(h, (SDL_GameControllerAxis)source.id);
-        if (source.kind == ControllerSource::Kind::AxisPositive)
-            return v > dz;
-        return v < -dz;
+    uint32_t binding = 0;
+    if (source.kind == ControllerSource::Kind::Button && (unsigned)source.id < 32) {
+        binding = RI_BUTTON(source.id);
+    } else if ((source.kind == ControllerSource::Kind::AxisPositive ||
+                source.kind == ControllerSource::Kind::AxisNegative) &&
+               (unsigned)source.id < RI_MAX_AXES) {
+        binding = RI_AXIS(source.id, source.kind == ControllerSource::Kind::AxisPositive);
     }
-    case ControllerSource::Kind::None:
-    default:
-        return false;
-    }
+    return psx_controller_binding_pressed(h, binding, dz);
 }
 
 /* Keyboard -> PSX button word for `player` (1 or 2), via the configurable
@@ -13188,6 +13184,10 @@ namespace {
     AeLanSock g_lnch_lan_udp = kAeLanSockInvalid;
     sockaddr_in g_lnch_lan_peers[kAeLanMaxSlots]{};
     bool g_lnch_lan_peer_ok[kAeLanMaxSlots]{};
+    NetplayLanRtt g_lnch_lan_rtt[kAeLanMaxSlots]{};
+    static uint64_t ae_np_lan_rtt_key(const sockaddr_in& address) {
+        return ((uint64_t)address.sin_addr.s_addr << 16) | address.sin_port;
+    }
     uint32_t g_lnch_lan_join_pulse_ms = 0;
     /* LAN list latency from last Refresh probe; -1 unknown. */
     int g_lnch_lan_latency_ms = -1;
@@ -13531,8 +13531,10 @@ namespace {
             std::fprintf(stderr, "LAN trace: close socket (host=%d guest=%d)\n",
                          g_lnch_hosting_lan, g_lnch_joined_lan);
         ae_np_lan_sock_close(&g_lnch_lan_udp);
-        for (int i = 0; i < kAeLanMaxSlots; ++i)
+        for (int i = 0; i < kAeLanMaxSlots; ++i) {
             g_lnch_lan_peer_ok[i] = false;
+            netplay_lan_rtt_bind(&g_lnch_lan_rtt[i], 0);
+        }
     }
 
     static void ae_np_lan_sync_legacy_names(AeLanLobbyState& state) {
@@ -13669,12 +13671,14 @@ namespace {
     static void ae_np_lan_clear_peer_slot(int slot) {
         if (slot < 0 || slot >= kAeLanMaxSlots) return;
         g_lnch_lan_peer_ok[slot] = false;
+        netplay_lan_rtt_bind(&g_lnch_lan_rtt[slot], 0);
     }
 
     static void ae_np_lan_set_peer_slot(int slot, const sockaddr_in& addr) {
         if (slot < 0 || slot >= kAeLanMaxSlots) return;
         g_lnch_lan_peers[slot] = addr;
         g_lnch_lan_peer_ok[slot] = true;
+        netplay_lan_rtt_bind(&g_lnch_lan_rtt[slot], ae_np_lan_rtt_key(addr));
     }
 
     static int ae_np_lan_endpoint_port(const std::string& endpoint) {
@@ -13787,6 +13791,17 @@ namespace {
 #else
         sendto(g_lnch_lan_udp, msg, (size_t)n, 0, (const sockaddr*)&to, sizeof(to));
 #endif
+    }
+
+    static void ae_np_lan_rtt_probe(int slot, const sockaddr_in& to, uint32_t now) {
+        if (slot < 0 || slot >= kAeLanMaxSlots) return;
+        NetplayLanRtt& sample = g_lnch_lan_rtt[slot];
+        netplay_lan_rtt_bind(&sample, ae_np_lan_rtt_key(to));
+        if (!netplay_lan_rtt_due(&sample, now)) return;
+        netplay_lan_rtt_sent(&sample, now);
+        char ping[48];
+        std::snprintf(ping, sizeof(ping), "MOTK7 PING\n%u\n", (unsigned)now);
+        ae_np_lan_udp_sendto(to, ping);
     }
 
     bool ae_np_read_lan_state(AeLanLobbyState* state) {
@@ -14682,6 +14697,7 @@ namespace {
         if (a < kAeLanMaxSlots && b < kAeLanMaxSlots) {
             std::swap(g_lnch_lan_peers[a], g_lnch_lan_peers[b]);
             std::swap(g_lnch_lan_peer_ok[a], g_lnch_lan_peer_ok[b]);
+            std::swap(g_lnch_lan_rtt[a], g_lnch_lan_rtt[b]);
             std::swap(g_lnch_lan_slot_bios[a], g_lnch_lan_slot_bios[b]);
             std::swap(g_lnch_lan_slot_memcard[a], g_lnch_lan_slot_memcard[b]);
         }
@@ -15107,6 +15123,7 @@ namespace {
         std::memset(caps->mods, 0, sizeof(caps->mods));
         const auto* title_profile = psx_mod_netplay_profile();
         const bool title_loading = title_profile && title_profile->loading_plugin_id;
+        const bool title_content = title_profile && title_profile->content_feature_count;
         if (const PSXModNetplayProfile* profile = title_loading ? nullptr : title_profile) {
             if (!profile->settings_package_id) return 1;
             RecompLauncherCModPackage package{};
@@ -15126,16 +15143,20 @@ namespace {
                 ae_append_feature_options(token, sizeof(token), mods, feature);
                 ae_copy_lobby_text(caps->mods[0].feats, sizeof(caps->mods[0].feats), token);
                 caps->mod_count = 1;
+                if (title_content) break;
                 std::string fingerprint;
                 if (!PSXRecompV4::mod_runtime_netplay_settings_fingerprint(
                         *caps, fingerprint, &g_lnch_mod_plan_error)) return 0;
                 ae_copy_lobby_text(caps->mod_plan_fp, sizeof(caps->mod_plan_fp), fingerprint.c_str());
                 return 1;
             }
-            g_lnch_mod_plan_error = "Title netplay settings feature is unavailable";
-            return 0;
+            if (!caps->mod_count) {
+                g_lnch_mod_plan_error = "Title netplay settings feature is unavailable";
+                return 0;
+            }
         }
-        if (!title_loading && !PSXRecompV4::mod_runtime_prepare_resources(g_launcher_disc_path,
+        if (!title_loading && !title_content &&
+            !PSXRecompV4::mod_runtime_prepare_resources(g_launcher_disc_path,
                                                        &g_lnch_mod_plan_error)) return 0;
         if (!mods || !mods->package_count || !mods->package_get)
             return 1;
@@ -15152,6 +15173,8 @@ namespace {
                                                                feature.id))
                     continue;
                 if (title_loading && !psx_mod_netplay_loading_feature(
+                        feature.package_id, feature.id)) continue;
+                if (title_content && !psx_mod_netplay_content_feature(
                         feature.package_id, feature.id)) continue;
                 int pkg_index = -1;
                 for (int j = 0; j < caps->mod_count; ++j) {
@@ -15188,6 +15211,13 @@ namespace {
             }
         }
 
+        if (title_content) {
+            std::string fingerprint;
+            if (!PSXRecompV4::mod_runtime_netplay_profile_content_fingerprint(*caps,
+                    g_launcher_disc_path, fingerprint, &g_lnch_mod_plan_error)) return 0;
+            ae_copy_lobby_text(caps->mod_plan_fp, sizeof(caps->mod_plan_fp), fingerprint.c_str());
+            return 1;
+        }
         if (caps->mod_count > 0) {
             const std::string fp = PSXRecompV4::mod_runtime_plan_fingerprint_portable(
                 g_launcher_disc_path, &g_lnch_mod_plan_error);
@@ -16033,6 +16063,9 @@ namespace {
              * unicast target (and for guests that listen between browses). */
             if (g_lnch_lan_udp != kAeLanSockInvalid && !st.started) {
                 const uint32_t now = SDL_GetTicks();
+                for (int slot = 0; slot < st.max_slots; ++slot)
+                    if (slot != st.host_slot && g_lnch_lan_peer_ok[slot])
+                        ae_np_lan_rtt_probe(slot, g_lnch_lan_peers[slot], now);
                 if (g_lnch_lan_beacon_announce_ms == 0u ||
                     now - g_lnch_lan_beacon_announce_ms >= 2000u) {
                     g_lnch_lan_beacon_announce_ms = now;
@@ -16055,6 +16088,8 @@ namespace {
                     to.sin_family = AF_INET;
                     to.sin_port = htons((uint16_t)ae_np_lan_endpoint_port(g_lnch_lan_endpoint));
                     if (inet_pton(AF_INET, host, &to.sin_addr) == 1) {
+                        if (!g_lnch_remote_lan_state.started)
+                            ae_np_lan_rtt_probe(g_lnch_remote_lan_state.host_slot, to, now);
                         std::string me = psx_lobby_display_name();
                         if (me.empty()) me = "Player";
                         char msg[640];
@@ -16098,6 +16133,41 @@ namespace {
                     inet_pton(AF_INET, host, &expected) != 1 ||
                     from.sin_addr.s_addr != expected.s_addr ||
                     ntohs(from.sin_port) != ae_np_lan_endpoint_port(g_lnch_lan_endpoint)) continue;
+            }
+            if (std::strncmp(buf, "MOTK7 PING\n", 11) == 0 ||
+                std::strncmp(buf, "MOTK7 PONG\n", 11) == 0) {
+                /* Measure only a seated peer, using its actual lobby endpoint.
+                 * Discovery packets and unrelated sockets cannot seed delay. */
+                int slot = -1;
+                const uint64_t key = ae_np_lan_rtt_key(from);
+                if (g_lnch_hosting_lan) {
+                    for (int i = 0; i < kAeLanMaxSlots; ++i)
+                        if (g_lnch_lan_peer_ok[i] &&
+                            ae_np_lan_rtt_key(g_lnch_lan_peers[i]) == key) {
+                            slot = i;
+                            break;
+                        }
+                } else {
+                    char host[64]; in_addr expected{};
+                    if (ae_np_lan_endpoint_host(g_lnch_lan_endpoint, host, sizeof(host)) &&
+                        inet_pton(AF_INET, host, &expected) == 1 &&
+                        from.sin_addr.s_addr == expected.s_addr &&
+                        ntohs(from.sin_port) == ae_np_lan_endpoint_port(g_lnch_lan_endpoint))
+                        slot = g_lnch_remote_lan_state.host_slot;
+                }
+                char* end = nullptr;
+                const unsigned long long echo = std::strtoull(buf + 11, &end, 10);
+                if (slot < 0 || slot >= kAeLanMaxSlots || end == buf + 11 ||
+                    *end != '\n' || end[1] != '\0' || echo > UINT32_MAX) continue;
+                if (buf[7] == 'I') {
+                    char pong[48];
+                    std::snprintf(pong, sizeof(pong), "MOTK7 PONG\n%u\n", (unsigned)echo);
+                    ae_np_lan_udp_sendto(from, pong);
+                } else {
+                    (void)netplay_lan_rtt_reply(&g_lnch_lan_rtt[slot], key,
+                                               (uint32_t)echo, SDL_GetTicks());
+                }
+                continue;
             }
             if (std::strncmp(buf, "MOTK6 MODS\n", 11) == 0 && g_lnch_remote_lan &&
                 g_netplay_content_negotiation) {
@@ -17368,6 +17438,16 @@ namespace {
                     out->is_host = (slot == state.host_slot) ? 1 : 0;
                     out->is_local = (slot == g_lnch_lan_my_slot) ? 1 : 0;
                     out->latency_ms = -1;
+                    if (!out->is_local) {
+                        if ((g_lnch_hosting_lan && g_lnch_lan_peer_ok[slot]) ||
+                            (g_lnch_remote_lan && slot == state.host_slot)) {
+                            if (g_lnch_lan_rtt[slot].peer)
+                                out->latency_ms = g_lnch_lan_rtt[slot].latency_ms;
+                        } else if (!g_lnch_remote_lan) {
+                            /* A file-only participant shares this machine. */
+                            out->latency_ms = 0;
+                        }
+                    }
                     if (out->is_local) {
                         ae_np_lan_sync_local_slot_bios();
                         ae_np_lan_sync_local_slot_memcard();
@@ -17453,6 +17533,7 @@ namespace {
             if (from_slot < kAeLanMaxSlots && to_slot < kAeLanMaxSlots) {
                 std::swap(g_lnch_lan_peers[from_slot], g_lnch_lan_peers[to_slot]);
                 std::swap(g_lnch_lan_peer_ok[from_slot], g_lnch_lan_peer_ok[to_slot]);
+                std::swap(g_lnch_lan_rtt[from_slot], g_lnch_lan_rtt[to_slot]);
             }
             state.started = false;
             ae_np_lan_sync_legacy_names(state);
@@ -17594,10 +17675,21 @@ namespace {
         } else if (std::strcmp(op, "settle") == 0) {
             char why[256] = {};
             PsxLobbyMatchCaps caps{};
-            if (psx_lobby_replay_room(req.c_str(), why, sizeof(why)) != 0 ||
-                ae_np_settle_start_caps(settings, &caps, why, sizeof(why)) != 0) {
+            const bool room_ready = psx_lobby_replay_room(req.c_str(), why, sizeof(why)) == 0;
+            if (room_ready && g_netplay_content_negotiation) {
+                // A standalone query has not received the launcher's disc callback.
+                const std::string d = disc[0] ? std::string(disc) : initial_disc;
+                if (!d.empty()) {
+                    RecompLauncherCDiscVerify dv{};
+                    ae_disc_verify(d.c_str(), &dv);
+                }
+            }
+            const bool settled = room_ready &&
+                ae_np_settle_start_caps(settings, &caps, why, sizeof(why)) == 0;
+            if (!settled || !g_lnch_mod_plan_error.empty()) {
                 ans += ",\"error\":";
-                ae_np_json_escaped(ans, why[0] ? why : "the match cannot be settled");
+                const char* detail = why[0] ? why : g_lnch_mod_plan_error.c_str();
+                ae_np_json_escaped(ans, detail[0] ? detail : "the match cannot be settled");
             } else if (psx_lobby_start_message(&caps, msg, sizeof(msg)) == 0) {
                 ans += ",\"start\":";
                 ans += msg;
@@ -20501,7 +20593,8 @@ int main(int argc, char** argv) {
         g_overlay_settings_path = settings_path;
 #endif
         std::string preservation_error;
-        if (!PSXRecompV4::preserve_legacy_player_settings(settings_path,&preservation_error))
+        if (!PSXRecompV4::preserve_legacy_player_settings(settings_path,&preservation_error,
+                game_config_path ? std::filesystem::path(game_config_path) : std::filesystem::path{}))
             std::fprintf(stderr,"psxrecomp: legacy player settings were not preserved: %s\n",
                          preservation_error.c_str());
         PSXRecompV4::UserSettings us =
@@ -22382,9 +22475,6 @@ session_reboot:
     /* A replay belongs to the session it started in. */
     replay_frontend_reset();
     s_replay_guest_restored = false;
-#if defined(PSX_NATIVE_KERNEL) && PSX_NATIVE_KERNEL
-    psx_native_card_bind(nullptr);
-#endif
     g_ovl_session_disc = resolved_disc.string();
     ovl_look_posted_reset();
     /* A new backend/session must not inherit the prior applied settings or
@@ -23697,23 +23787,6 @@ session_reboot:
      * REPLACES the old fast_boot snapshot restore, and fast_boot=true now
      * aliases the boot-skip alone. Env overrides: PSX_BIOS_HLE /
      * PSX_BIOS_HLE_KEEP_INTRO ('0' = off, anything else = on). */
-#if defined(PSX_NATIVE_KERNEL) && PSX_NATIVE_KERNEL
-    {
-        std::string boot_error;
-        if (!psx_prepare_native_bios_boot(cpu, resolved_disc.string(), boot_error)) {
-            std::fprintf(stderr, "psxrecomp: native kernel startup: %s\n", boot_error.c_str());
-            return 1;
-        }
-        psx_bios_hle_configure_native();
-        psx_native_card_bind(&cpu);
-        psx_idle_skip_set_hw_countdown_timing(1);
-        // The scheduler restores the live thread from its TCB on the very
-        // first dispatch, so publish the initial register context through its
-        // existing guest-ABI writer before it takes ownership.
-        psx_sched_save_context(&cpu, psx_sched_current_tcb(&cpu), cpu.pc);
-        std::fprintf(stdout, "psxrecomp: native kernel boot entry=0x%08x\n", cpu.pc);
-    }
-#else
     {
         /* How this session boots. Offline it is the player's choice (the
          * game's game.toml, then settings.toml, then the launcher). The peers
@@ -23745,14 +23818,14 @@ session_reboot:
         /* The two axes (kernel-call HLE, boot-skip) have DIFFERENT per-image
          * requirements, so they are decided in ONE pure place —
          * psx_bios_hle_plan(), runtime/src/bios_hle_plan.c. Conflating them
-         * broke boot-skip on OpenBIOS: call-HLE needs the event table ABI,
+         * broke boot-skip on OpenBIOS: call-HLE needs deliver_event_ret, the
          * boot-skip needs only shell_entry_phys, so refusing the former must
          * not silently cancel the latter. */
         PsxBiosHleRequest req;
         req.bios_hle               = boot.bios_hle;
         req.keep_intro             = boot.keep_intro;
         req.fast_boot              = boot.fast_boot;
-        req.have_event_abi         = psx_bios_hle_event_abi_supported();
+        req.have_deliver_event_ret = (psx_bios_image.deliver_event_ret != 0);
         req.have_shell_entry       = (psx_bios_image.shell_entry_phys != 0);
         req.have_game_entry        = (game_entry_pc != 0);
         const PSXModNetplayProfile* boot_profile = psx_mod_netplay_profile();
@@ -23763,11 +23836,14 @@ session_reboot:
         }
         const PsxBiosHlePlan plan = psx_bios_hle_plan(req);
 
-        /* B0 event calls rely on the selected image's kernel event table. */
+        /* Call-HLE is a per-image capability, not just a preference: an image
+         * exporting no DeliverEvent anchor (OpenBIOS until validated) declares
+         * that axis STRUCTURALLY UNAVAILABLE — servicing B0 events with
+         * mismatched semantics wedges the guest in event waits. */
         if (plan.call_hle_denied) {
             std::fprintf(stdout,
-                "psxrecomp: bios_hle kernel-call tier unavailable on %s "
-                "(unverified event table ABI); kernel calls stay LLE\n",
+                "psxrecomp: bios_hle kernel-call tier unavailable on %s (no "
+                "DeliverEvent anchor); kernel calls stay LLE\n",
                 psx_bios_image.image_id);
         }
         if (plan.boot_skip_denied) {
@@ -23788,7 +23864,6 @@ session_reboot:
     /* R3000A reset state. */
     cpu.pc = 0xBFC00000u;
     cpu.cop0[12] = 0x00400000u; /* SR: BEV=1 (boot exception vectors) */
-#endif
 
     /* Host hotkeys: config.ini [KeyMap] next to the exe (VolumeUp/Down).
      * Prefer exe-dir file; if missing, fall back to cwd config.ini so a

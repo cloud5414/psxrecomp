@@ -178,6 +178,10 @@ if(BUILD_TESTING)
     if(CMAKE_C_COMPILER_ID STREQUAL "GNU")
         find_package(Python3 COMPONENTS Interpreter)
         if(Python3_Interpreter_FOUND)
+            add_test(NAME spu_word_mmio
+                COMMAND ${Python3_EXECUTABLE}
+                    ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_spu_word_mmio.py
+                    --cc ${CMAKE_C_COMPILER})
             add_test(NAME direct_guest_memory
                 COMMAND ${Python3_EXECUTABLE}
                     ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_direct_guest_memory.py
@@ -348,6 +352,9 @@ if(BUILD_TESTING)
     add_executable(lobby_launch_transport_test tests/test_lobby_launch_transport.c)
     target_include_directories(lobby_launch_transport_test PRIVATE include)
     add_test(NAME lobby_launch_transport_test COMMAND lobby_launch_transport_test)
+    add_executable(netplay_lan_rtt_test tests/test_netplay_lan_rtt.c)
+    target_include_directories(netplay_lan_rtt_test PRIVATE include)
+    add_test(NAME netplay_lan_rtt_test COMMAND netplay_lan_rtt_test)
     add_executable(netplay_fmv_confirm_test tests/test_netplay_fmv_confirm.c)
     target_include_directories(netplay_fmv_confirm_test PRIVATE include)
     add_test(NAME netplay_fmv_confirm_test COMMAND netplay_fmv_confirm_test)
@@ -1335,6 +1342,12 @@ add_test(NAME sio_dualshock_config_replies_test COMMAND sio_dualshock_config_rep
     target_link_libraries(keyboard_pad_chord_test PRIVATE ${PSX_SDL_LIBRARIES})
     add_test(NAME keyboard_pad_chord_test COMMAND keyboard_pad_chord_test)
 
+    add_executable(controller_binding_snapshot_test tests/test_controller_binding_snapshot.cpp)
+    target_include_directories(controller_binding_snapshot_test PRIVATE include ${PSX_SDL_INCLUDE_DIRS})
+    target_compile_definitions(controller_binding_snapshot_test PRIVATE SDL_MAIN_HANDLED $<$<BOOL:${PSX_SDL3}>:PSX_SDL3=1>)
+    target_link_libraries(controller_binding_snapshot_test PRIVATE ${PSX_SDL_LIBRARIES} recomp-input::core)
+    add_test(NAME controller_binding_snapshot_test COMMAND controller_binding_snapshot_test)
+
     add_executable(mouse_binding_suppression_test tests/test_mouse_binding_suppression.c)
     target_include_directories(mouse_binding_suppression_test PRIVATE include ${PSX_SDL_INCLUDE_DIRS})
     target_compile_definitions(mouse_binding_suppression_test PRIVATE
@@ -2117,21 +2130,13 @@ add_test(NAME sio_dualshock_config_replies_test COMMAND sio_dualshock_config_rep
     add_test(NAME program_set_lock_test COMMAND program_set_lock_test)
 
     # The player-facing "skip the BIOS" flag must resolve to the same boot
-    # behaviour across shell-entry images, regardless of the event table ABI.
+    # behaviour on retail SCPH-1001 and on the bundled OpenBIOS, whose
+    # kernel-call HLE is (correctly) refused for want of a DeliverEvent anchor.
     add_executable(bios_hle_plan_test
         tests/test_bios_hle_plan.c
         src/bios_hle_plan.c)
     target_include_directories(bios_hle_plan_test PRIVATE include)
     add_test(NAME bios_hle_plan_test COMMAND bios_hle_plan_test)
-
-    add_executable(bios_hle_events_test
-        tests/test_bios_hle_events.c
-        src/bios_hle.c
-        src/native_bios_services.c
-        src/native_bios_card.c)
-    target_compile_definitions(bios_hle_events_test PRIVATE PSX_NATIVE_KERNEL=1)
-    target_include_directories(bios_hle_events_test PRIVATE include)
-    add_test(NAME bios_hle_events_test COMMAND bios_hle_events_test)
 
     # Every func_override failure mode is silent at runtime: a registration
     # that is never consulted, a package override that survives clear-mods
@@ -2229,7 +2234,6 @@ add_test(NAME sio_dualshock_config_replies_test COMMAND sio_dualshock_config_rep
     add_executable(disc_boot_image_test
         tests/test_disc_boot_image.cpp
         src/disc_boot_image.cpp
-        src/native_bios_boot.cpp
         src/iso_reader.cpp
         src/cue_sheet.cpp)
     target_include_directories(disc_boot_image_test PRIVATE include ${PSXRECOMP_ROOT}/recompiler/include)
@@ -3294,11 +3298,23 @@ add_test(NAME sio_dualshock_config_replies_test COMMAND sio_dualshock_config_rep
                              --compiler ${CMAKE_CXX_COMPILER})
         endif()
         if(CMAKE_C_COMPILER_ID MATCHES "GNU|Clang")
+              add_test(NAME netplay_lan_rtt_wiring_test
+                       COMMAND ${Python3_EXECUTABLE}
+                               ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_netplay_lan_rtt_wiring.py
+                               --compiler ${CMAKE_CXX_COMPILER})
             add_test(NAME netplay_rb_session_reset_test
                      COMMAND ${Python3_EXECUTABLE}
                              ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_netplay_rb_session_reset.py
                              --compiler ${CMAKE_C_COMPILER})
             if(PSXRECOMP_TEST_HAS_RBENGINE)
+                if(TARGET recomp_net)
+                    add_test(NAME netplay_delay_admit_test
+                             COMMAND ${Python3_EXECUTABLE}
+                                     ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_netplay_delay_admit.py
+                                     --compiler ${CMAKE_C_COMPILER}
+                                     --recomp-net ${_RNET_ROOT}
+                                     --library $<TARGET_FILE:recomp_net>)
+                endif()
                 add_test(NAME netplay_commit_lineage_test
                          COMMAND ${Python3_EXECUTABLE}
                                  ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_netplay_commit_lineage.py
@@ -3631,6 +3647,7 @@ if(BUILD_TESTING)
     add_test(NAME audio_catchup_test COMMAND audio_catchup_test)
     add_executable(audio_sink_resume_test tests/test_audio_sink_resume.c)
     target_include_directories(audio_sink_resume_test PRIVATE src)
+    target_link_libraries(audio_sink_resume_test PRIVATE recomp-audio::core)
     if(NOT WIN32)
         target_link_libraries(audio_sink_resume_test PRIVATE m)
     endif()
@@ -3666,3 +3683,24 @@ if(BUILD_TESTING AND CMAKE_C_COMPILER_ID STREQUAL "GNU")
     target_compile_options(memory_cd_register_mirror_test PRIVATE -O2 -fwhole-program)
     add_test(NAME memory_cd_register_mirror_test COMMAND memory_cd_register_mirror_test)
 endif()
+
+# Compatibility reader/parser targets use the shared implementation too.
+get_property(_shared_targets DIRECTORY PROPERTY BUILDSYSTEM_TARGETS)
+foreach(_target IN LISTS _shared_targets)
+  get_target_property(_sources ${_target} SOURCES)
+  if("${_sources}" MATCHES "(frame_pacing|host_deadline)[.]c")
+    target_link_libraries(${_target} PRIVATE retro-runtime::presentation)
+  endif()
+  if("${_sources}" MATCHES "(playtest_diagnostics|diagnostic_writer|diagnostic_telemetry)")
+    target_link_libraries(${_target} PRIVATE recomp-diagnostics-core::core)
+  endif()
+  if("${_sources}" MATCHES "mod_runtime[.]cpp")
+    target_link_libraries(${_target} PRIVATE recomp-mod-core::core)
+  endif()
+  if("${_sources}" MATCHES "memcard[.]c|boot_state|capture_writer|tas_checkpoint_roundtrip|netplay_capture_ring|atomic_file_write")
+    target_link_libraries(${_target} PRIVATE recomp-persistence-core::core)
+  endif()
+  if("${_sources}" MATCHES "(iso_reader|cue_sheet)[.]cpp")
+    target_link_libraries(${_target} PRIVATE recomp-image-core::core)
+  endif()
+endforeach()
