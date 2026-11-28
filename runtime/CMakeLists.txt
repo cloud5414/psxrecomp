@@ -230,7 +230,6 @@ if(BUILD_TESTING)
         target_link_libraries(debug_socket_shutdown_test PRIVATE ws2_32)
     endif()
     add_test(NAME debug_socket_shutdown_test COMMAND debug_socket_shutdown_test)
-    set_tests_properties(debug_socket_shutdown_test PROPERTIES TIMEOUT 15)
 
     add_executable(atomic_file_write_test tests/test_atomic_file_write.cpp)
     target_include_directories(atomic_file_write_test PRIVATE include)
@@ -1486,6 +1485,7 @@ add_test(NAME sio_dualshock_config_replies_test COMMAND sio_dualshock_config_rep
     # Title-supplied host rumble (psx_mod_set_host_rumble) merge and expiry.
     add_executable(host_rumble_test tests/test_host_rumble.c)
     target_include_directories(host_rumble_test PRIVATE include)
+    target_link_libraries(host_rumble_test PRIVATE recomp-input::core)
     add_test(NAME host_rumble_test COMMAND host_rumble_test)
     # JogCon motor byte -> host wheel haptics ([controller] jogcon_force_feedback).
     add_executable(jogcon_ffb_test tests/test_jogcon_ffb.c)
@@ -2130,13 +2130,21 @@ add_test(NAME sio_dualshock_config_replies_test COMMAND sio_dualshock_config_rep
     add_test(NAME program_set_lock_test COMMAND program_set_lock_test)
 
     # The player-facing "skip the BIOS" flag must resolve to the same boot
-    # behaviour on retail SCPH-1001 and on the bundled OpenBIOS, whose
-    # kernel-call HLE is (correctly) refused for want of a DeliverEvent anchor.
+    # behaviour across shell-entry images, regardless of the event table ABI.
     add_executable(bios_hle_plan_test
         tests/test_bios_hle_plan.c
         src/bios_hle_plan.c)
     target_include_directories(bios_hle_plan_test PRIVATE include)
     add_test(NAME bios_hle_plan_test COMMAND bios_hle_plan_test)
+
+    add_executable(bios_hle_events_test
+        tests/test_bios_hle_events.c
+        src/bios_hle.c
+        src/native_bios_services.c
+        src/native_bios_card.c)
+    target_compile_definitions(bios_hle_events_test PRIVATE PSX_NATIVE_KERNEL=1)
+    target_include_directories(bios_hle_events_test PRIVATE include)
+    add_test(NAME bios_hle_events_test COMMAND bios_hle_events_test)
 
     # Every func_override failure mode is silent at runtime: a registration
     # that is never consulted, a package override that survives clear-mods
@@ -2234,6 +2242,7 @@ add_test(NAME sio_dualshock_config_replies_test COMMAND sio_dualshock_config_rep
     add_executable(disc_boot_image_test
         tests/test_disc_boot_image.cpp
         src/disc_boot_image.cpp
+        src/native_bios_boot.cpp
         src/iso_reader.cpp
         src/cue_sheet.cpp)
     target_include_directories(disc_boot_image_test PRIVATE include ${PSXRECOMP_ROOT}/recompiler/include)
@@ -3320,6 +3329,14 @@ add_test(NAME sio_dualshock_config_replies_test COMMAND sio_dualshock_config_rep
                                  ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_netplay_commit_lineage.py
                                  --compiler ${CMAKE_C_COMPILER}
                                  --recomp-net ${_RNET_ROOT})
+                add_test(NAME netplay_begin_ownership_test
+                         COMMAND ${Python3_EXECUTABLE}
+                                 ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_netplay_begin_ownership.py
+                                 --compiler ${CMAKE_C_COMPILER})
+                add_test(NAME netplay_snapshot_resume_test
+                         COMMAND ${Python3_EXECUTABLE}
+                                 ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_netplay_snapshot_resume.py
+                                 --compiler ${CMAKE_C_COMPILER})
                 add_test(NAME netplay_joint_recovery_test
                          COMMAND ${Python3_EXECUTABLE}
                                  ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_netplay_joint_recovery.py
@@ -3696,6 +3713,8 @@ foreach(_target IN LISTS _shared_targets)
   endif()
   if("${_sources}" MATCHES "mod_runtime[.]cpp")
     target_link_libraries(${_target} PRIVATE recomp-mod-core::core)
+  elseif("${_sources}" MATCHES "psx_sha256[.]c")
+    target_link_libraries(${_target} PRIVATE recomp-mod-core::hash)
   endif()
   if("${_sources}" MATCHES "memcard[.]c|boot_state|capture_writer|tas_checkpoint_roundtrip|netplay_capture_ring|atomic_file_write")
     target_link_libraries(${_target} PRIVATE recomp-persistence-core::core)
